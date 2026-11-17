@@ -23,6 +23,31 @@ class SearchRequest(BaseModel):
     enable_rewrite: bool = Field(True, description="有多轮历史时是否做 query 改写")
 
 
+class TrafficOrigin(BaseModel):
+    """交通富化的显式起点（GCJ-02 火星坐标）。"""
+    lat: float
+    lon: float
+    display_name: str = ""
+
+
+class TrafficView(BaseModel):
+    """单家店的交通摘要（给前端卡片用，不含坐标/polyline，合规红线）。"""
+    shop_id: str
+    modes: dict = Field(default_factory=dict, description="{driving/cycling/walking/transit: {...}}")
+    available: bool = True
+
+
+class TrafficOut(BaseModel):
+    """交通富化结果：与 answer/shops 平行的旁路字段。"""
+    status: str = "ok"
+    real_data: bool = Field(False, description="true=真实地图 API；false=mock 模拟")
+    source: str = ""
+    message: str = ""
+    origin: dict | None = None
+    latency_ms: float = 0.0
+    shops: list[TrafficView] = Field(default_factory=list)
+
+
 class AnswerRequest(BaseModel):
     """端到端：检索 + 生成 + 引用校验。"""
     query: str = Field(..., min_length=1, max_length=200)
@@ -39,6 +64,12 @@ class AnswerRequest(BaseModel):
     include_trace: bool = Field(False)
     session_id: str | None = Field(None, description="多轮会话 ID；传入则读历史改写 query 并落库")
     enable_rewrite: bool = Field(True, description="有多轮历史时是否做 query 改写")
+    # ---- 交通富化（检索后、LLM 前的旁路；默认关闭，不传则行为与旧版完全一致）----
+    enable_traffic: bool = Field(False, description="是否启用实时交通富化；默认关闭，零开销")
+    traffic_origin: TrafficOrigin | None = Field(None, description="显式起点（GCJ-02）；优先级最高")
+    client_gps: TrafficOrigin | None = Field(None, description="浏览器 GPS（WGS-84，自动转 GCJ-02）")
+    traffic_area: str | None = Field(None, description="出发商圈名，如『体育西路』")
+    use_traffic_ip: bool = Field(False, description="用 IP 定位起点（仅城市级，精细 mode 会被拦截）")
 
 
 # ---------------- 多轮会话 ----------------
@@ -148,6 +179,7 @@ class AnswerResponse(BaseModel):
     clarify_question: str | None = None
     shops: list[ShopOut] = Field(default_factory=list)
     trace: TraceOut | None = None
+    traffic: TrafficOut | None = Field(None, description="交通富化旁路结果；未启用为 None")
 
 
 class HealthResponse(BaseModel):
@@ -155,4 +187,5 @@ class HealthResponse(BaseModel):
     detail: str = ""
     llm_configured: bool = Field(False, description="是否检测到 LLM key")
     collection_points: int | None = None
+    traffic_configured: bool = Field(False, description="是否配置了真实腾讯地图 key")
     uptime_s: float = 0.0

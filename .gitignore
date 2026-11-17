@@ -34,8 +34,12 @@ eval/out/
 .env
 .env.*
 !.env.example
-# 本地启动脚本含 LLM key，禁止提交
+# 本地启动脚本含 LLM / 地图 key，禁止提交
 scripts/start_backend.sh
+traffic/start_traffic.sh
+traffic/.env.local
+# key 配置模板（无真实值）可提交
+!traffic/.env.local.example
 
 # ---------- 日志 / 临时文件 / 系统文件 ----------
 *.log

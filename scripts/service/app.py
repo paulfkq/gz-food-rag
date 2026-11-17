@@ -29,6 +29,8 @@ from pathlib import Path
 
 # 让本文件既可被 uvicorn "service.app:app" 导入，也可直接 python 运行
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# traffic 是项目根目录下的独立包（与主链路零耦合的旁路模块）
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from fastapi import FastAPI, Request, HTTPException  # noqa: E402
 from fastapi.responses import StreamingResponse  # noqa: E402
@@ -40,7 +42,7 @@ from retrieve.config import COLLECTION  # noqa: E402
 from generate.llm_client import LLMClient  # noqa: E402
 from generate.answer import AnswerGenerator  # noqa: E402
 from generate.prompt import SYSTEM_PROMPT, build_user_prompt  # noqa: E402
-from generate.guard import validate  # noqa: E402
+from generate.guard import validate, repair_citations  # noqa: E402
 from generate.rewrite import rewrite_query  # noqa: E402
 from . import session_store  # noqa: E402
 from .eval_api import router as eval_router  # noqa: E402  评估系统可视化 API
@@ -48,6 +50,7 @@ from .schemas import (  # noqa: E402
     SearchRequest, AnswerRequest, ShopOut, TraceOut, SearchResponse,
     AnswerResponse, HealthResponse, RewriteOut, SessionCreateOut,
     SessionOut, MessageOut, RenameSessionRequest, BeginTurnRequest,
+    TrafficOut, TrafficView,
 )
 
 START_TIME = time.time()
@@ -191,7 +194,7 @@ def _save_turn(session_id: str | None, original: str, rewritten: str | None,
 
 def _build_persist_meta(*, req, trace, hits, rewrite=None,
                         mode="", guard_reason="", need_clarify=False,
-                        clarify_question="") -> dict:
+                        clarify_question="", traffic=None) -> dict:
     """构造落库 meta：除运行状态外，带齐"刷新后回显"所需的展示态。
 
     背景：早期 meta 只存 mode/count，前端历史消息不回填卡片（怕响应体膨胀）。
@@ -214,6 +217,8 @@ def _build_persist_meta(*, req, trace, hits, rewrite=None,
     if need_clarify:
         meta["need_clarify"] = True
         meta["clarify_question"] = clarify_question or ""
+    if traffic is not None:
+        meta["traffic"] = traffic.model_dump() if hasattr(traffic, "model_dump") else traffic
     if rewrite is not None and getattr(rewrite, "changed", False):
         meta["rewrite"] = {
             "original": req.query,
@@ -221,6 +226,86 @@ def _build_persist_meta(*, req, trace, hits, rewrite=None,
             "reason": rewrite.reason,
         }
     return meta
+
+
+# ---------------- 交通富化（检索后 / LLM 前的旁路）----------------
+
+def _enrich_traffic(req, hits) -> tuple[str, str, TrafficOut | None]:
+    """在检索完成后、LLM 生成前旁路富化交通。返回 (system_extra, user_extra, traffic_out)。
+
+    设计红线（docs/02）：
+        - 交通只追加到 prompt，不改 hits / shops，不进检索打分 —— RAG 指标开/关完全一致；
+        - 任何异常/无起点都吞掉，返回空串与 None，地图服务挂了答案 100% 照常生成。
+    默认 enable_traffic=False，不传就是零开销、行为与旧版完全一致。
+    """
+    if not getattr(req, "enable_traffic", False) or not hits:
+        return "", "", None
+    try:
+        from traffic.integration import (
+            enrich_for_hits, traffic_prompt_block, TRAFFIC_RULES,
+        )
+        from traffic import config as tconfig
+
+        origin = None
+        if getattr(req, "traffic_origin", None):
+            origin = {"lat": req.traffic_origin.lat, "lon": req.traffic_origin.lon,
+                      "display_name": req.traffic_origin.display_name}
+        client_gps = None
+        if getattr(req, "client_gps", None):
+            client_gps = {"lat": req.client_gps.lat, "lon": req.client_gps.lon}
+
+        enrichment = enrich_for_hits(
+            hits,
+            origin=origin,
+            client_gps=client_gps,
+            business_area=getattr(req, "traffic_area", None) or None,
+            use_ip=getattr(req, "use_traffic_ip", False),
+        )
+        if enrichment is None:  # 无起点信息 / 异常：静默跳过
+            return "", "", None
+
+        block = traffic_prompt_block(enrichment, hits)
+        if not block:
+            return "", "", None
+
+        # 转成对外精简视图：按 shop_id 聚合四档，不含坐标/polyline。
+        by_shop: dict[str, dict] = {}
+        for p in enrichment.route_plans:
+            sid = p.get("shop_id", "")
+            by_shop.setdefault(sid, {})[p.get("mode", "?")] = p
+        shops_out = [
+            TrafficView(
+                shop_id=sid,
+                modes=modes,
+                available=any(p.get("available", True) for p in modes.values()),
+            )
+            for sid, modes in by_shop.items()
+        ]
+        source = ""
+        if enrichment.route_plans:
+            source = enrichment.route_plans[0].get("source", "")
+        t_out = TrafficOut(
+            status=enrichment.status,
+            real_data=bool(tconfig.HAS_REAL_KEY),
+            source=source,
+            message=enrichment.message,
+            origin=enrichment.origin.model_dump(mode="json") if enrichment.origin else None,
+            latency_ms=round(enrichment.latency_ms, 1),
+            shops=shops_out,
+        )
+        return (TRAFFIC_RULES if block else ""), block, t_out
+    except Exception as e:  # noqa: BLE001 —— 地图是旁路，绝不拖垮 RAG
+        print(f"[traffic] 富化异常（已降级，不影响回答）: {type(e).__name__}: {e}", flush=True)
+        return "", "", None
+
+
+def _traffic_configured() -> bool:
+    """health 用：是否配置了真实地图 key（不读 key 本身，只见布尔值）。"""
+    try:
+        from traffic import config as tconfig
+        return bool(tconfig.HAS_REAL_KEY)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------- 端点 ----------------
@@ -235,6 +320,7 @@ def root():
             "/api/sessions", "/api/eval/runs", "/docs",
         ],
         "eval_page": "/eval.html",
+        "traffic_demo": "http://127.0.0.1:8100/demo",
     }
 
 
@@ -253,6 +339,7 @@ def health(request: Request):
         detail=st.detail,
         llm_configured=bool(st.llm.config.available) if hasattr(st, "llm") else False,
         collection_points=points,
+        traffic_configured=_traffic_configured(),
         uptime_s=round(time.time() - START_TIME, 1),
     )
 
@@ -388,9 +475,13 @@ async def answer(req: AnswerRequest, request: Request):
                                        need_clarify=True, clarify_question=trace.clarify_question))
         return out
 
+    # 交通富化：检索后、LLM 前。返回追加到 prompt 的块 + 对外展示视图；异常静默降级。
+    system_extra, user_extra, traffic_out = await run_in_threadpool(_enrich_traffic, req, hits)
+
     if req.use_llm:
         ans = await run_in_threadpool(
             st.generator.generate, actual_query, hits, trace.slots.summary(),
+            system_extra, user_extra,
         )
     else:
         ans = await run_in_threadpool(_template_only, st.generator, hits)
@@ -409,12 +500,14 @@ async def answer(req: AnswerRequest, request: Request):
         slots=trace.slots.summary(),
         shops=[_shop_out(i, h) for i, h in enumerate(hits, 1)],
         trace=_trace_out(trace, req.include_trace),
+        traffic=traffic_out,
     )
     # 落库：把这一轮 user + assistant 存起来，下一轮就能做上下文改写。
     # meta 里带齐展示态，刷新后店铺卡片/trace/条件摘要/改写标签能还原。
     _save_turn(req.session_id, req.query, rewrite.query if rewrite else None, ans.text,
                _build_persist_meta(req=req, trace=trace, hits=hits, rewrite=rewrite,
-                                   mode=ans.mode, guard_reason=ans.guard_reason))
+                                   mode=ans.mode, guard_reason=ans.guard_reason,
+                                   traffic=traffic_out))
     return out
 
 
@@ -422,6 +515,26 @@ def _template_only(generator, hits):
     """强制模板：复用生成层的 _template，但不调用 LLM。"""
     from generate.answer import GeneratedAnswer
     return GeneratedAnswer(text=generator._template(hits), mode="template", guard_reason="user_disabled")
+
+
+def _validate_or_repair(text: str, hits: list) -> tuple[bool, str, str]:
+    """校验优先；仅"引用错位"可精准修复，修完复验。
+
+    Returns:
+        (是否通过, 最终文本, guard_reason)
+        guard_reason 为 "pass" 或 "auto_repaired:<修复明细>" 时表示通过。
+    """
+    g = validate(text, hits)
+    if g.ok:
+        return True, text, "pass"
+    if "引用错位" in g.reason:
+        fixed, repairs = repair_citations(text, hits)
+        if repairs:
+            g2 = validate(fixed, hits)
+            if g2.ok:
+                return True, fixed, "auto_repaired:" + "；".join(repairs)
+            return False, fixed, g2.reason
+    return False, text, g.reason
 
 
 @app.post("/api/answer/stream", tags=["rag"])
@@ -451,6 +564,7 @@ async def stream_answer(req: AnswerRequest, request: Request):
             token     - 正文增量片段（策略 B 才有）
             answer    - 完整答案（策略 A，或模板降级）
             guard     - 校验结果 {ok, reason}
+            corrected - 引用错位已自动修正后的 LLM 答案（策略 B，replace=true，不算降级）
             fallback  - 校验失败时的模板答案（策略 B，replace=true）
             done      - 结束，带耗时统计
             error     - 异常终止
@@ -486,15 +600,20 @@ async def stream_answer(req: AnswerRequest, request: Request):
 
             slots_summary = trace.slots.summary() if trace.slots else ""
 
+            # 交通富化：检索后、LLM 前旁路执行；异常静默降级，不影响后续任何分支。
+            system_extra, user_extra, traffic_out = await run_in_threadpool(
+                _enrich_traffic, req, hits,
+            )
+
             # 各终止分支共用：用本轮的 req/trace/hits/rewrite 构造落库 meta。
             # 把展示态一起落库，刷新后店铺卡片/trace/条件摘要/改写标签能还原。
             def mk_meta(**kw):
                 return _build_persist_meta(req=req, trace=trace, hits=hits,
-                                           rewrite=rewrite, **kw)
+                                           rewrite=rewrite, traffic=traffic_out, **kw)
 
             # meta 里带上结构化店铺、trace、改写结果：前端首屏立即渲染，
             # 并把"原始 → 改写"展示给用户（可解释性）。
-            yield _sse("meta", {
+            meta_payload = {
                 "count": len(hits),
                 "slots": slots_summary,
                 "query": actual_query,
@@ -503,7 +622,10 @@ async def stream_answer(req: AnswerRequest, request: Request):
                 "shops": [_shop_out(i, h).model_dump() for i, h in enumerate(hits, 1)],
                 "trace": _trace_out(trace, req.include_trace).model_dump()
                 if req.include_trace and _trace_out(trace, True) else None,
-            })
+            }
+            if traffic_out is not None:
+                meta_payload["traffic"] = traffic_out.model_dump()
+            yield _sse("meta", meta_payload)
 
             if trace.need_clarify:
                 final_text = trace.clarify_question or ""
@@ -531,32 +653,33 @@ async def stream_answer(req: AnswerRequest, request: Request):
                 yield _sse("done", {"total_ms": round((time.time() - t0) * 1000, 1)})
                 return
 
-            user_prompt = build_user_prompt(actual_query, slots_summary, hits)
+            user_prompt = build_user_prompt(actual_query, slots_summary, hits) + user_extra
+            system_prompt = SYSTEM_PROMPT + system_extra
 
             if req.buffer_guard:
                 # ---- 策略 A：缓冲全文 -> 校验 -> 一次性吐 ----
-                full = await _collect_stream(st.llm, SYSTEM_PROMPT, user_prompt)
+                full = await _collect_stream(st.llm, system_prompt, user_prompt)
                 if not full:
                     final_text = await run_in_threadpool(st.generator._template, hits)
                     final_meta = mk_meta(mode="template", guard_reason="llm_empty")
                     yield _sse("answer", {"text": final_text, "mode": "template", "guard_reason": "llm_empty"})
                     yield _sse("guard", {"ok": False, "reason": "llm_empty"})
                 else:
-                    g = await run_in_threadpool(validate, full, hits)
-                    if g.ok:
-                        final_text = full
-                        final_meta = mk_meta(mode="llm", guard_reason="pass")
-                        yield _sse("answer", {"text": final_text, "mode": "llm", "guard_reason": "pass"})
-                        yield _sse("guard", {"ok": True, "reason": "pass"})
+                    ok, checked, reason = await run_in_threadpool(_validate_or_repair, full, hits)
+                    if ok:
+                        final_text = checked
+                        final_meta = mk_meta(mode="llm", guard_reason=reason)
+                        yield _sse("answer", {"text": final_text, "mode": "llm", "guard_reason": reason})
+                        yield _sse("guard", {"ok": True, "reason": reason})
                     else:
                         final_text = await run_in_threadpool(st.generator._template, hits)
-                        final_meta = mk_meta(mode="template", guard_reason=g.reason)
-                        yield _sse("answer", {"text": final_text, "mode": "template", "guard_reason": g.reason})
-                        yield _sse("guard", {"ok": False, "reason": g.reason})
+                        final_meta = mk_meta(mode="template", guard_reason=reason)
+                        yield _sse("answer", {"text": final_text, "mode": "template", "guard_reason": reason})
+                        yield _sse("guard", {"ok": False, "reason": reason})
             else:
                 # ---- 策略 B：逐字流式 -> 事后校验 -> 失败给 fallback 覆盖 ----
                 buf = []
-                async for piece in _iter_stream(st.llm, SYSTEM_PROMPT, user_prompt):
+                async for piece in _iter_stream(st.llm, system_prompt, user_prompt):
                     buf.append(piece)
                     yield _sse("token", {"text": piece})
                 full = "".join(buf)
@@ -566,15 +689,24 @@ async def stream_answer(req: AnswerRequest, request: Request):
                     final_meta = mk_meta(mode="template", guard_reason="llm_empty")
                     yield _sse("fallback", {"text": final_text, "replace": True, "reason": "llm_empty"})
                 else:
-                    g = await run_in_threadpool(validate, full, hits)
-                    yield _sse("guard", {"ok": g.ok, "reason": g.reason or "pass"})
-                    if g.ok:
-                        final_text = full
-                        final_meta = mk_meta(mode="llm", guard_reason="pass")
+                    ok, checked, reason = await run_in_threadpool(_validate_or_repair, full, hits)
+                    if ok:
+                        if reason.startswith("auto_repaired:"):
+                            # 已逐字吐出错店名 -> 用 corrected 覆盖为修正文本，
+                            # 但仍是 LLM 答案，不标"降级"。
+                            yield _sse("corrected", {
+                                "text": checked, "mode": "llm", "replace": True, "reason": reason,
+                            })
+                            yield _sse("guard", {"ok": True, "reason": reason})
+                        else:
+                            yield _sse("guard", {"ok": True, "reason": reason})
+                        final_text = checked
+                        final_meta = mk_meta(mode="llm", guard_reason=reason)
                     else:
+                        yield _sse("guard", {"ok": False, "reason": reason})
                         final_text = await run_in_threadpool(st.generator._template, hits)
-                        final_meta = mk_meta(mode="template", guard_reason=g.reason)
-                        yield _sse("fallback", {"text": final_text, "replace": True, "reason": g.reason})
+                        final_meta = mk_meta(mode="template", guard_reason=reason)
+                        yield _sse("fallback", {"text": final_text, "replace": True, "reason": reason})
 
             persist()
             yield _sse("done", {

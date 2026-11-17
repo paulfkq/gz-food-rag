@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from retrieve.verify import FinalHit
 from .llm_client import LLMClient, LLMConfig
 from .prompt import SYSTEM_PROMPT, build_user_prompt
-from .guard import validate
+from .guard import validate, repair_citations
 
 
 @dataclass
@@ -27,7 +27,13 @@ class AnswerGenerator:
     def __init__(self, client: LLMClient | None = None):
         self.client = client or LLMClient()
 
-    def generate(self, query: str, hits: list[FinalHit], slots_summary: str = "") -> GeneratedAnswer:
+    def generate(self, query: str, hits: list[FinalHit], slots_summary: str = "",
+                 system_extra: str = "", user_extra: str = "") -> GeneratedAnswer:
+        """生成答案。system_extra/user_extra 是可选追加块（交通富化用），默认空串完全向后兼容。
+
+        交通块只追加到 prompt，不进入 validate() 的引用校验口径 —— guard 仍按餐厅资料
+        校验编号/店名，交通数字由 TRAFFIC_RULES 约束 LLM 照抄，不参与"是否照抄资料"判定。
+        """
         if not hits:
             return GeneratedAnswer(
                 text="根据现有资料，没有找到符合条件的店。可以试试放宽价格、区域或口味要求。",
@@ -36,14 +42,29 @@ class AnswerGenerator:
 
         import time
         t0 = time.time()
-        llm_text = self.client.chat(SYSTEM_PROMPT, build_user_prompt(query, slots_summary, hits))
+        system_prompt = SYSTEM_PROMPT + (system_extra or "")
+        user_prompt = build_user_prompt(query, slots_summary, hits) + (user_extra or "")
+        llm_text = self.client.chat(system_prompt, user_prompt)
         llm_ms = (time.time() - t0) * 1000
 
         if llm_text:
             g = validate(llm_text, hits)  # 引用校验：LLM 答案也未必可信
             if g.ok:
                 return GeneratedAnswer(llm_text, mode="llm", guard_reason="pass", llm_ms=llm_ms)
+
+            # 引用错位可精准修复：正文事实是好的，只是店名 token 串了。
+            # 修完【必须重新 validate】——复验不过照样降级，绝不带着脏答案出门。
             reason = g.reason
+            if "引用错位" in reason:
+                fixed, repairs = repair_citations(llm_text, hits)
+                if repairs:
+                    g2 = validate(fixed, hits)
+                    if g2.ok:
+                        detail = "；".join(repairs)
+                        return GeneratedAnswer(
+                            fixed, mode="llm", guard_reason=f"auto_repaired:{detail}", llm_ms=llm_ms
+                        )
+                    reason = g2.reason  # 修完还有别的问题 -> 用新原因降级
         else:
             reason = "LLM 不可用或返回空"
 

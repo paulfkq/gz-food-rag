@@ -6,6 +6,7 @@ import {
 } from './api'
 import ShopCard from './components/ShopCard.vue'
 import TracePanel from './components/TracePanel.vue'
+import TrafficCard from './components/TrafficCard.vue'
 
 // ---------------- 状态 ----------------
 // 会话
@@ -35,6 +36,8 @@ function settingsFor(id) {
     sessionSettings[id] = {
       mode: 'stream', topn: 8, preferLlmSlots: true,
       useLlm: true, bufferGuard: true, includeTrace: true,
+      // 交通富化：默认关闭（不消耗地图配额）；开启后需填出发商圈或用定位
+      enableTraffic: false, trafficArea: '', useTrafficIp: false,
     }
   }
   return sessionSettings[id]
@@ -46,9 +49,38 @@ const preferLlmSlots = computed({ get: () => curSettings.value.preferLlmSlots, s
 const useLlm = computed({ get: () => curSettings.value.useLlm, set: v => { curSettings.value.useLlm = v } })
 const bufferGuard = computed({ get: () => curSettings.value.bufferGuard, set: v => { curSettings.value.bufferGuard = v } })
 const includeTrace = computed({ get: () => curSettings.value.includeTrace, set: v => { curSettings.value.includeTrace = v } })
+const enableTraffic = computed({ get: () => curSettings.value.enableTraffic, set: v => { curSettings.value.enableTraffic = v } })
+const trafficArea = computed({ get: () => curSettings.value.trafficArea, set: v => { curSettings.value.trafficArea = v } })
+const useTrafficIp = computed({ get: () => curSettings.value.useTrafficIp, set: v => { curSettings.value.useTrafficIp = v } })
 
 const error = ref('')
 const health = ref(null)
+
+// 交通起点：浏览器 GPS（WGS-84）。后端收到后自动转 GCJ-02。
+// 用 ref 而非 sessionSettings：定位是设备级信息，与会话无关，各会话共用最后一次定位即可。
+const clientGps = ref(null)
+const locating = ref(false)
+function locate() {
+  if (!navigator.geolocation) { error.value = '当前浏览器不支持定位'; return }
+  locating.value = true
+  error.value = ''
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      clientGps.value = {
+        lat: pos.coords.latitude, lon: pos.coords.longitude,
+        display_name: '我的位置（GPS）',
+      }
+      locating.value = false
+      // 开启交通但没填商圈时，自动勾上交通开关
+      if (!enableTraffic.value) enableTraffic.value = true
+    },
+    (err) => {
+      locating.value = false
+      error.value = `定位失败：${err.message || '用户拒绝或不可用'}（可改用填商圈）`
+    },
+    { timeout: 8000, maximumAge: 60000 },
+  )
+}
 
 // ★ 按会话隔离的"运行中状态"（方案 B 核心）：
 // 早版这里是全局单例（单个 abortController / busy / thinking），所以切会话只能 abort 掉正在跑的请求。
@@ -75,6 +107,11 @@ function stateFor(id) {
   }
   return sessionState[id]
 }
+
+// guard_reason 判定：pass 与 auto_repaired(引用已自动校正)都算校验通过。
+// auto_repaired: 后面跟修复明细，故用前缀判断，不能只 Equality 比较 'pass'。
+const guardIsOk = (reason) => reason === 'pass' || (typeof reason === 'string' && reason.startsWith('auto_repaired:'))
+const guardLabel = (reason) => reason && reason.startsWith('auto_repaired:') ? '引用已校正' : reason
 
 // 下面这些 computed 是"当前显示会话"的状态视图 —— 模板无需改动，切换会话自动跟随。
 const curState = computed(() => stateFor(currentId.value))
@@ -192,6 +229,7 @@ function backendToMessages(s) {
       meta,
       shops: meta.shops || [],
       trace: meta.trace || null,
+      traffic: meta.traffic || null,
       needClarify: !!meta.need_clarify,
       clarifyQuestion: meta.clarify_question || '',
       rewrite,
@@ -225,6 +263,7 @@ function syncFromBackend(id, s) {
     if (!cur) return
     if (cur.shops && cur.shops.length) m.shops = cur.shops
     if (cur.trace) m.trace = cur.trace
+    if (cur.traffic) m.traffic = cur.traffic       // 交通卡片：meta 落库版优先，前端富信息兜底
     if (cur.needClarify) m.needClarify = cur.needClarify
     if (cur.clarifyQuestion) m.clarifyQuestion = cur.clarifyQuestion
     if (cur.rewrite) m.rewrite = cur.rewrite            // applyRewrite 补的带 reason 版本更全
@@ -331,7 +370,7 @@ async function run() {
   //   修改 aMsg.content 不会触发 Vue 视图更新 —— 会导致"全文一次性显示"和"改写标签不显示"。
   const aMsg = reactive({
     role: 'assistant', content: '', rewrite: null, shops: [],
-    needClarify: false, clarifyQuestion: '', meta: {},
+    needClarify: false, clarifyQuestion: '', meta: {}, traffic: null,
   })
   arr.push(aMsg)
   await scrollToBottom()
@@ -364,6 +403,11 @@ async function run() {
     buffer_guard: snap.bufferGuard,
     session_id: runSessionId,
     enable_rewrite: true,
+    // 交通富化参数（发起时快照，后台运行不串台）
+    enable_traffic: !!snap.enableTraffic,
+    traffic_area: (snap.trafficArea || '').trim() || null,
+    use_traffic_ip: !!snap.useTrafficIp,
+    client_gps: clientGps.value,   // 由「定位」按钮填充（WGS-84），无则为 null
   }
 
   try {
@@ -418,6 +462,7 @@ function fillResult(aMsg, data, arr) {
   aMsg.shops = data.shops || []
   aMsg.meta = { slots: data.slots || '', mode: data.mode || '', guard_reason: data.guard_reason || '' }
   aMsg.trace = data.trace || null
+  aMsg.traffic = data.traffic || null
   aMsg.needClarify = !!data.need_clarify
   aMsg.clarifyQuestion = data.clarify_question || ''
 }
@@ -448,8 +493,8 @@ async function doAnswer(body, aMsg, signal, st, sid, arr) {
   } else {
     aMsg.content = data.answer || ''
     st.guard = {
-      ok: data.guard_reason === 'pass',
-      reason: data.guard_reason || '', mode: data.mode || '',
+      ok: guardIsOk(data.guard_reason),
+      reason: guardLabel(data.guard_reason) || '', mode: data.mode || '',
     }
   }
 }
@@ -462,6 +507,7 @@ async function doStream(body, aMsg, signal, st, sid, arr) {
       applyRewrite(aMsg, d, arr)
       if (d.shops) aMsg.shops = d.shops
       if (d.trace) aMsg.trace = d.trace
+      if (d.traffic) aMsg.traffic = d.traffic
       aMsg.meta = { slots: d.slots || '' }
       scrollIfVisible(sid)
     },
@@ -475,9 +521,15 @@ async function doStream(body, aMsg, signal, st, sid, arr) {
     answer: (d) => {
       stopThinking(sid)
       aMsg.content = d.text
-      st.guard = { ok: d.guard_reason === 'pass', reason: d.guard_reason || '', mode: d.mode || '' }
+      st.guard = { ok: guardIsOk(d.guard_reason), reason: guardLabel(d.guard_reason) || '', mode: d.mode || '' }
     },
-    guard: (d) => { st.guard = { ok: d.ok, reason: d.reason || '', mode: st.guard.mode } },
+    corrected: (d) => {
+      stopThinking(sid)
+      // 引用错位已自动修正：覆盖已吐出的错文本，但仍是 LLM 答案，不标降级。
+      if (d.replace) aMsg.content = d.text
+      st.guard = { ok: true, reason: guardLabel(d.reason) || '引用已校正', mode: d.mode || 'llm' }
+    },
+    guard: (d) => { st.guard = { ok: d.ok, reason: guardLabel(d.reason) || '', mode: st.guard.mode } },
     fallback: (d) => {
       stopThinking(sid)
       if (d.replace) { aMsg.content = d.text; st.degraded = true }
@@ -626,6 +678,10 @@ onUnmounted(() => {
                 </div>
               </div>
 
+              <!-- 交通参考卡片：与 meta 一起到达，LLM 生成前即可显示 -->
+              <TrafficCard v-if="m.traffic && m.traffic.shops && m.traffic.shops.length"
+                           :traffic="m.traffic" :shops="m.shops || []" />
+
               <!-- Trace -->
               <details v-if="m.trace" class="msg-trace">
                 <summary>查看 Trace 明细</summary>
@@ -646,6 +702,18 @@ onUnmounted(() => {
           <label class="opt-check" v-if="mode !== 'search'"><input type="checkbox" v-model="useLlm" /> LLM 生成</label>
           <label class="opt-check" v-if="mode === 'stream'"><input type="checkbox" v-model="bufferGuard" /> 先校验后输出</label>
           <label class="opt-check"><input type="checkbox" v-model="includeTrace" /> Trace</label>
+          <label class="opt-check" title="检索后、LLM 前旁路富化交通；默认关闭以节省地图配额">
+            <input type="checkbox" v-model="enableTraffic" /> 交通
+          </label>
+        </div>
+        <!-- 交通起点：填商圈名 / 用浏览器定位 / IP 粗定位（仅城市级） -->
+        <div class="traffic-options" v-if="enableTraffic">
+          <label>出发商圈 <input type="text" v-model="trafficArea" class="opt-text"
+                 placeholder="如：体育西路（留空则用定位/IP）" /></label>
+          <button type="button" class="btn-locate" @click="locate" :disabled="locating">
+            {{ locating ? '定位中…' : (clientGps ? '✓ 已定位' : '📍 用我的位置') }}
+          </button>
+          <label class="opt-check" title="IP 定位仅城市级，精细交通会被拦截"><input type="checkbox" v-model="useTrafficIp" /> IP 粗定位</label>
         </div>
         <div class="composer-row">
           <textarea v-model="query" class="composer-input" rows="2"

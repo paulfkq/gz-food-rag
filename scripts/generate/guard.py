@@ -68,6 +68,42 @@ def check_citations(answer: str, hits: list[FinalHit]) -> GuardResult:
     return GuardResult(True)
 
 
+def repair_citations(answer: str, hits: list[FinalHit]) -> tuple[str, list[str]]:
+    """自动修复引用错位：把 `店名[N]` 里对不上的店名，换成编号 N 的真实店名。
+
+    为什么值得修（而不是一律降级到模板）：
+        LLM 常被高相似店名骗到——"广记灶/桥头灶/桥头轩·西华路肠粉"这种同后缀
+        命名，模型记住了编号却抄错了字号。此时正文的事实、结构、语气都是好的，
+        只有店名这一个 token 串了。整份降级成模板太可惜；精准替换 + 复验更划算。
+
+    保守原则（防止"越修越错"）：
+        1. 只对编号合法（1..n）且明显不对齐的引用动手；非法编号交给 validate 拦。
+        2. 只替换紧跟 [N] 前的那个店名 token，不碰正文其它内容、不碰数字。
+        3. 返回修复记录，修复后【必须重新 validate】；复验不过照样降级。
+        4. 合法简称（core 命中、或真名前缀在名里）一律不动，避免误伤。
+
+    Returns:
+        (修复后的答案, 修复记录列表)  记录形如 "广记灶[5] → 桥头灶·西华路肠粉[5]"
+    """
+    n = len(hits)
+    repairs: list[str] = []
+
+    def _repl(m: "re.Match") -> str:
+        name, num = m.group(1), m.group(2)
+        idx = int(num)
+        if not (1 <= idx <= n):
+            return m.group(0)  # 非法编号：不动，留给 validate 判定
+        truth = hits[idx - 1].shop_name
+        core = name.split("·")[0]
+        if core in truth or truth.split("·")[0] in name:
+            return m.group(0)  # 已对齐（含合法简称）
+        repairs.append(f"{name}[{num}] → {truth}[{num}]")
+        return f"{truth}[{num}]"
+
+    fixed = re.sub(r"([\u4e00-\u9fa5A-Za-z0-9·]{2,12})\s*\[(\d+)\]", _repl, answer)
+    return fixed, repairs
+
+
 def check_numbers(answer: str, hits: list[FinalHit]) -> GuardResult:
     """轻量数字核验：答案里显式写的 ¥数字 必须出现在资料中。"""
     cited_nums = set(re.findall(r"[¥￥]\s*(\d+)", answer))

@@ -99,7 +99,7 @@ export function answer(body, signal) {
  * SSE 流式答案。
  *
  * @param {object}   body          请求体（query/topn/buffer_guard/use_llm...）
- * @param {object}   handlers      事件回调：{ meta, token, answer, guard, fallback, clarify, done, error }
+ * @param {object}   handlers      事件回调：{ meta, token, answer, guard, corrected, fallback, clarify, done, error }
  * @param {AbortSignal} signal     用于中断请求（用户点"停止"）
  *
  * 设计要点：
@@ -107,6 +107,8 @@ export function answer(body, signal) {
  *      所以用 buffer 累积，按 \n\n 切分，最后一段落回 buffer。
  *   2. fallback 覆盖：buffer_guard=false 时校验失败会推 fallback 事件（replace=true），
  *      调用方（App.vue）收到后应把已显示的流式文本替换为模板答案 —— 这里原样透传。
+ *   3. corrected 覆盖：引用错位被自动修正时推 corrected 事件（replace=true），
+ *      同样是覆盖文本，但仍是 LLM 答案、不算降级 —— 调用方应与 fallback 区分处理。
  *   3. 每个回调都 try/catch 包住？不需要 —— 让异常冒泡到外层统一处理，避免吞错。
  */
 export async function answerStream(body, handlers, signal) {

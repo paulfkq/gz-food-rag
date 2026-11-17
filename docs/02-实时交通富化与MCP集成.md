@@ -82,7 +82,7 @@ POST /ask
 | **横评里的坑** | 2026 年不少"地图 MCP 横评"把 Mapbox 列进来并夸其 Matrix / Isochrone 能力 | ❌ **不可因为"横评里有"就采用**：Mapbox 不在合规白名单，且不支持国内地图数据、无公交路径规划，对本场景双重不合格 |
 | **坐标系** | 境内统一 **GCJ-02**（火星坐标）；百度为 BD-09，天地图为 CGCS2000 | 店铺 `geo` 字段、pre-filter 的 `geo_radius`、路线起终点**必须同一坐标系**；浏览器 GPS 的 WGS-84 必须转换后再调用，否则偏移数百米 |
 | **密钥** | 绝不能内嵌 / 预置 / 夹带任何有效地图 API key；不得产出带可用 key 的完整代码 | 本项目是**独立部署的 Python 服务**，不是 WorkBuddy 内嵌页面 → 前端 GL JS 的 `_TMapSecurityConfig` 代理模式不适用，属于**非默认场景**：需自行申请 key，经**服务端环境变量**注入 |
-| **key 申请入口** | 腾讯位置服务开放平台（`lbs.qq.com`）→ 控制台创建应用 → 开通 WebService API（路径规划 / 距离矩阵 / 定位）→ 配置域名或 IP 白名单 → 查看调用配额 | 配置里写显式占位符，**真实 key 只存环境变量，绝不进仓库、日志、LLM 上下文、前端** |
+| **key 申请入口** | 腾讯位置服务开放平台（`lbs.qq.com`）→ 控制台创建应用 → 添加 Key 时勾选 **WebServiceAPI**（路线规划 / 距离矩阵 / IP 定位 / 地址解析都是它下面的接口族，**不是三个独立开关**）→ 配置 IP 白名单 → 查看调用配额 | 配置里写显式占位符，**真实 key 只存环境变量，绝不进仓库、日志、LLM 上下文、前端**；控制台逐步操作与自检见 `docs/13` |
 | **服务端防护** | 后端代理鉴权；Streamable HTTP 必须校验 `Origin` 头防 DNS rebinding；本地服务只绑 `127.0.0.1` | MCP Server 统一实现；商业场景必须后端代理，不能把 key 放前端 |
 | **个人信息** | 不得收集 / 存储 / 公开他人位置数据；个人坐标仅本地私有存储 | 用户位置只在**会话内存**，不落库、不写日志；IP 定位仅取城市级；提供"不授权定位"的手动输入路径 |
 | **本需求不渲染地图**（v1.1 修订） | **不画地图、不画路线、不落坐标点串**；但 v1.1 起公共交通需返回**文本化换乘明细**（线路名 / 站名 / 时长 / 步行距离），这些是结构化文本，不是地图渲染 | 仍不引入 GL JS / 瓦片，合规面不变；`polyline` / `bounds` / 站点 `location` 一律在 Provider 适配层丢弃，不外发、不落库。若后续加可视化页，再按默认代理模式（SDK URL 不带 key）处理 |
@@ -404,7 +404,7 @@ if not key:
     )
 ```
 
-**申请步骤**：`lbs.qq.com` → 控制台 → 创建应用 → 开通「路径规划 / 距离矩阵 / 定位」对应 WebService API → 配置域名或 IP 白名单 → 查看每日配额与 QPS 限制 → key 写入本机环境变量。
+**申请步骤**：`lbs.qq.com` → 控制台 → 创建应用 → 添加 Key 时勾选 **WebServiceAPI**（路线规划 / 距离矩阵 / IP 定位 / 地址解析均属该产品的接口族，无需逐个「开通」；个别增值接口若报 `status=113` 才去配额管理单独申请）→ 配置 IP 白名单 → 查看每日配额与 QPS 限制 → key 写入本机环境变量。完整逐步截图式说明与自检命令见 `docs/13-腾讯MapKey配置与RAG接入指南.md`。
 
 ---
 
@@ -517,3 +517,21 @@ if not key:
 | §9 依赖 | 追加 MCP SDK / httpx |
 | §7 坑表 | v1.3 新增 3 条（单位换算、routes/lines 混淆、方案不确定） |
 | §8 面试 | v1.2 的 10 问 + v1.1 新增 4 问 |
+
+---
+
+## 15. 实现落地状态（2026-11-17，Phase 5.5 已完成）
+
+本方案已落地为**独立模块 `traffic/`**，零干扰主链路（不改 `scripts/` 与 `front/`），独立端口 `8100`。
+
+| 子步骤 | 落地情况 |
+|---|---|
+| 5.5.1 四档方案 | ✅ `route_plans` 聚合工具，4 mode 并发；无 key 时用确定性 mock（结构同腾讯），有 `TENCENT_MAP_KEY` 自动切真实 WebService |
+| 5.5.2 LocationProvider + 坐标系 | ✅ 优先级链（显式>会话>GPS>WGS84 转换>商圈>IP 城市级）；`wgs84_to_gcj02` 已实现；城市级定位拦截精细 mode |
+| 5.5.3 自建 MCP Server | ✅ `mcp_server/server.py`：JSON-RPC 2.0 + Streamable HTTP(`/mcp`) + stdio 双传输；5 个工具；Origin 校验 + 只绑 127.0.0.1；`Mcp-Method/Name` 头。**未装 mcp SDK**（环境无依赖且避免冲突），用纯协议实现，语义一致 |
+| 5.5.4 富化层 + 粒度分级 | ✅ 并发/超时/缓存(网格化+时间桶)/降级/合并；`normalize.py` 做单位归一化 + `routes[]` 二次排序与平局 + `lines[0]` + 换乘步行 + 303 剔除 + 粒度分级（其余三档无 legs/polyline） |
+| 5.5.5 评估与消融 | ✅ 36 个单测覆盖 §11 全部确定性指标；`RAG 指标不变性`用"开/关富化 shops 不被修改"单测证明。真实 Recall/NDCG 消融未做——因富化独立运行、输入 shops 只读，逻辑上不影响主链路指标 |
+
+**运行**：`python -m traffic.serve`（8100）；演示页 `/demo`；单测 `python -m unittest discover -s traffic/tests -v`。
+**接入主链路**：`merge_into_answer()` 提供生成后结构化合并示例，当前未启用（详见 `traffic/README.md`）。
+**已知边界**：① 轨道 A（官方托管 MCP Server 直连）仅提供 Client 框架（`HttpMcpClient`），未配真实官方 endpoint（无 key）。② 腾讯 provider 的 `route_matrix` 当前复用逐目的地逻辑，未走 matrix 批量接口优化。③ 无真实 key 时为 mock 数据，所有响应标注 `source=mock`，不伪装真实。

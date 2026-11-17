@@ -26,6 +26,36 @@ eval/
     └── qdrant_eval/    # 索引副本（与在线服务并行用）
 ```
 
+## 可视化评估中心（Web UI）
+
+命令行评估结果已接入一个独立前端页面，无需记命令即可触发评估、看指标、做历史对比：
+
+- **入口**：对话前端左下角「📈 评估中心」，或直接访问 `http://127.0.0.1:5173/eval.html`
+- **四个 Tab**：
+  1. **结果总览** — 选一次运行，展示 full 主指标卡片、消融表、自动洞察
+  2. **触发评估** — 勾选消融配置/样本数/RAGAS，点「启动评估」，实时看进度条与日志；完成的运行自动进入列表
+  3. **历史对比** — 选基线与新结果，逐指标 Δ（优/劣/平）+ 消融归因（默认预置 baseline vs results_v2）
+  4. **结果明细** — 逐条查看 query / 召回店铺 / 确定性指标 / RAGAS / 答案
+
+背后的 HTTP API（挂在 8000 服务的 `/api/eval/*`）：
+
+| 端点 | 作用 |
+|---|---|
+| `GET /api/eval/runs` | 列出所有历史评估运行 |
+| `GET /api/eval/runs/{id}/summary` | 某次运行的聚合指标 + 洞察（复用 report.collect） |
+| `GET /api/eval/runs/{id}/detail` | 逐条结果 |
+| `GET /api/eval/compare?base=&new=` | 两次运行逐指标对比 |
+| `POST /api/eval/run` | 触发评估（后台子进程，返回 task_id） |
+| `GET /api/eval/tasks/{id}` | 任务进度 + 日志尾部 |
+
+**为什么触发评估用子进程而不是在 8000 进程内跑**（面试讲点）：
+- 不在 API 进程内 import RetrievalPipeline —— 否则 8000 会再加载一份 4.4GB 模型；
+- 子进程指向索引副本 `RAG_QDRANT_PATH=eval/out/qdrant_eval`，与在线服务不抢 Qdrant 锁；
+- Popen 继承父进程 env（LLM key 已在服务启动时注入），密钥不经过前端、不落盘；
+- 单任务并发限制 + `eval_tasks.json` 状态落盘，重启后 running 自动标记中断。
+
+> 实现细节与面试讲点见 `scripts/service/eval_api.py` 顶部注释。
+
 ## 快速开始
 
 ```bash

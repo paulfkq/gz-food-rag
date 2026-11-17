@@ -80,6 +80,24 @@ body {
 }
 .session-item:hover .session-del { opacity: 1; }
 .session-del:hover { color: #f87171; }
+/* ---------- 跳转评估中心入口 ---------- */
+.eval-entry {
+  display: flex; align-items: center; gap: 10px; margin: 4px 12px 0;
+  padding: 10px 12px; border-radius: 10px; text-decoration: none;
+  background: rgba(217,119,6,.12); border: 1px solid rgba(217,119,6,.3);
+  color: #fff; transition: background .15s, border-color .15s;
+}
+.eval-entry:hover { background: rgba(217,119,6,.25); border-color: var(--primary); }
+.eval-entry-icon {
+  width: 30px; height: 30px; flex: none; border-radius: 8px; font-size: 16px;
+  background: linear-gradient(135deg, var(--primary), #f59e0b);
+  display: flex; align-items: center; justify-content: center;
+}
+.eval-entry-text { flex: 1; min-width: 0; }
+.eval-entry-text strong { display: block; font-size: 13px; }
+.eval-entry-text small { display: block; font-size: 10px; color: #a8a29e; margin-top: 1px; }
+.eval-entry-arrow { color: var(--primary); font-size: 16px; flex: none; }
+
 .sidebar-foot {
   padding: 14px 20px; border-top: 1px solid rgba(255,255,255,.1);
   font-size: 11px; color: #a8a29e; display: flex; align-items: center; gap: 8px;

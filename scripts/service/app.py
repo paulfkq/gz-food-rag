@@ -43,6 +43,7 @@ from generate.prompt import SYSTEM_PROMPT, build_user_prompt  # noqa: E402
 from generate.guard import validate  # noqa: E402
 from generate.rewrite import rewrite_query  # noqa: E402
 from . import session_store  # noqa: E402
+from .eval_api import router as eval_router  # noqa: E402  评估系统可视化 API
 from .schemas import (  # noqa: E402
     SearchRequest, AnswerRequest, ShopOut, TraceOut, SearchResponse,
     AnswerResponse, HealthResponse, RewriteOut, SessionCreateOut,
@@ -101,6 +102,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 评估系统可视化 API（独立路由模块，复用 report/compare 的聚合口径）
+app.include_router(eval_router)
 
 
 # ---------------- 工具函数 ----------------
@@ -228,8 +232,9 @@ def root():
         "docs": "/docs",
         "endpoints": [
             "/health", "/api/search", "/api/answer", "/api/answer/stream",
-            "/api/sessions", "/docs",
+            "/api/sessions", "/api/eval/runs", "/docs",
         ],
+        "eval_page": "/eval.html",
     }
 
 

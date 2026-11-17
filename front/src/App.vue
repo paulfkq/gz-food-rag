@@ -535,6 +535,15 @@ onUnmounted(() => {
           <button class="session-del" @click="removeSession(s.id, $event)" title="删除">×</button>
         </div>
       </div>
+      <!-- 跳转评估中心（独立多页面）：与对话页同源，走同一后端 /api/eval/* -->
+      <a href="/eval.html" class="eval-entry" title="查看评估指标 / 触发评估 / 历史对比">
+        <span class="eval-entry-icon">📈</span>
+        <span class="eval-entry-text">
+          <strong>评估中心</strong>
+          <small>指标报告 · 触发评估 · 历史对比</small>
+        </span>
+        <span class="eval-entry-arrow">→</span>
+      </a>
       <div class="sidebar-foot">
         <span class="status-dot" :class="healthBadge.cls"></span>{{ healthBadge.text }}
       </div>

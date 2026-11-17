@@ -34,6 +34,8 @@ eval/out/
 .env
 .env.*
 !.env.example
+# 本地启动脚本含 LLM key，禁止提交
+scripts/start_backend.sh
 
 # ---------- 日志 / 临时文件 / 系统文件 ----------
 *.log

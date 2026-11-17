@@ -3,13 +3,16 @@
 新手提示：把"路径 / 模型名"这种会变的量集中到一个文件，是工程里最基本的
 可维护性习惯。换机器时只改这里，其他模块不用动。
 """
+import os
 from pathlib import Path
 
 # scripts/retrieve/config.py -> parents[2] 就是项目根 gz-food-rag/
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 CHUNKS_PATH = PROJECT_ROOT / "data" / "chunks" / "chunks.jsonl"
-QDRANT_PATH = PROJECT_ROOT / "data" / "qdrant"
+# 默认路径不变；可用 RAG_QDRANT_PATH 指向副本，供评估进程与在线服务并行
+# （Qdrant embedded 是单进程独占，同一路径不能被两个进程同时打开）
+QDRANT_PATH = Path(os.environ.get("RAG_QDRANT_PATH") or (PROJECT_ROOT / "data" / "qdrant"))
 BM25_CACHE_PATH = PROJECT_ROOT / "data" / "bm25.pkl"
 
 COLLECTION = "gz_food_chunks"

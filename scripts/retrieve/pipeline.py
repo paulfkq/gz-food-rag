@@ -65,7 +65,8 @@ class RetrievalPipeline:
 
     def search(self, query: str, topn: int = config.RERANK_TOPN,
                now_hour: int | None = None,
-               prefer_llm: bool | None = None) -> tuple[list[FinalHit], Trace]:
+               prefer_llm: bool | None = None,
+               ablation: dict | None = None) -> tuple[list[FinalHit], Trace]:
         """执行一次检索。
 
         prefer_llm 是【并发安全的 per-request 参数】：
@@ -77,14 +78,26 @@ class RetrievalPipeline:
         两个并发请求会互相覆盖（A 设 False、B 设 True，A 结束时恢复的值污染 B），
         是真实竞态。改成参数传递后，每次调用自带配置，共享的只有只读模型/索引，
         并发天然安全 —— 这是允许多会话并行的前置条件。
+
+        ablation 是【评估专用】的 per-request 消融开关（默认全开=线上行为）：
+          - use_rerank: False 跳过 BGE-Rerank，直接用 RRF 顺序
+          - use_hard_filter: False 关闭 pre-filter + 后置复核（观察硬约束的价值）
+          - recall_routes: 只启用指定召回路，如 ["dense"]（观察多路召回的价值）
+        关硬约束时用空 SearchSlots 编译 filter/复核，但 trace.slots 仍保留原解析
+        结果，便于分析"解析对了但没执行"造成的指标差异。
         """
         trace = Trace(query=query)
+        ab = ablation or {}
+        use_rerank = ab.get("use_rerank", True)
+        use_hard_filter = ab.get("use_hard_filter", True)
+        routes = ab.get("recall_routes", ["dense", "sparse", "bm25"])
         t = time.time()
 
         # ① 槽位解析：本次请求的偏好优先，未指定才回退到实例默认值
         use_llm = self.prefer_llm if prefer_llm is None else prefer_llm
         slots = parse_slots(query, prefer_llm=use_llm)
         trace.slots = slots
+        filter_slots = slots if use_hard_filter else SearchSlots()
         trace.need_clarify = slots.need_clarify
         trace.clarify_question = slots.clarify_question
         trace.timings_ms["1_slots"] = (time.time() - t) * 1000
@@ -93,7 +106,7 @@ class RetrievalPipeline:
 
         # ② 编译 Filter
         t = time.time()
-        qfilter = compile_filter(slots, now_hour=now_hour)
+        qfilter = compile_filter(filter_slots, now_hour=now_hour)
         trace.filter_dump = qfilter.model_dump() if qfilter else None
         trace.timings_ms["2_filter"] = (time.time() - t) * 1000
 
@@ -108,7 +121,7 @@ class RetrievalPipeline:
         # 所以 BM25 召回后必须立刻用同一套 verify_hard 过滤（与后置复核同源）。
         bm25 = []
         for c in bm25_raw:
-            ok, _ = verify_hard(c.payload, slots, now_hour=now_hour)
+            ok, _ = verify_hard(c.payload, filter_slots, now_hour=now_hour)
             if ok:
                 bm25.append(c)
         trace.recall_counts = {"dense": len(dense), "sparse": len(sparse),
@@ -117,7 +130,8 @@ class RetrievalPipeline:
 
         # ④ RRF 融合
         t = time.time()
-        fused = rrf_fuse([dense, sparse, bm25])
+        _routes: dict[str, list] = {"dense": dense, "sparse": sparse, "bm25": bm25}
+        fused = rrf_fuse([_routes[r] for r in routes if r in _routes])
         trace.rrf_top = [
             {"shop": c.payload.get("shop_name"), "rrf": round(c.score, 4), "sources": c.sources}
             for c in fused[:10]
@@ -126,7 +140,10 @@ class RetrievalPipeline:
 
         # ⑤ Rerank 精排（取 RRF 前 N）
         t = time.time()
-        reranked = self.reranker.rerank(query, fused[:config.RRF_TOPN], topn=topn)
+        if use_rerank:
+            reranked = self.reranker.rerank(query, fused[:config.RRF_TOPN], topn=topn)
+        else:
+            reranked = fused[:topn]  # 消融：跳过精排，直接用 RRF 顺序
         trace.rerank_top = [
             {"shop": c.payload.get("shop_name"), "score": round(c.score, 4),
              "sources": c.sources, "ranks": c.ranks}
@@ -136,7 +153,7 @@ class RetrievalPipeline:
 
         # ⑥ 硬约束复核 + Parent 回溯
         t = time.time()
-        final, rejected = verify_and_expand(reranked, slots, self.parents, now_hour=now_hour)
+        final, rejected = verify_and_expand(reranked, filter_slots, self.parents, now_hour=now_hour)
         trace.rejected = rejected
         trace.timings_ms["6_verify"] = (time.time() - t) * 1000
 

@@ -27,6 +27,9 @@ front/.vite/
 front/test-results/
 front/playwright-report/
 
+# ---------- 评估结果（体积大且可重新生成；goldset.jsonl 是基准数据，要提交） ----------
+eval/out/
+
 # ---------- 环境变量 / 密钥（本地 LLM key 通过启动命令注入，不落盘） ----------
 .env
 .env.*

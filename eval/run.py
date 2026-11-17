@@ -39,13 +39,20 @@ ABLATIONS: dict[str, dict] = {
     "no_hard_filter": {"prefer_llm": True,  "ablation": {"use_hard_filter": False}},
     "dense_only":     {"prefer_llm": True,  "ablation": {"recall_routes": ["dense"]}},
     "rule_slots":     {"prefer_llm": False, "ablation": {}},
+    # 新增消融：关掉店铺级去重，复现优化前的 chunk 级 Top-N 行为，用于量化优化收益
+    "chunk_topn":     {"prefer_llm": True,  "ablation": {"shop_dedup": False}},
 }
 
 
 def load_samples(path: Path, limit: int | None) -> list[dict]:
+    """加载评估样本。冲突样本（expect_clarify）始终包含在内，不受 limit 影响——
+    它们是验证 need_clarify 的关键样本，不该被"只跑前 N 条"截断漏掉。"""
     with path.open(encoding="utf-8") as f:
         rows = [json.loads(l) for l in f if l.strip()]
-    return rows[:limit] if limit else rows
+    normal = [r for r in rows if not r.get("expect_clarify")]
+    clarify = [r for r in rows if r.get("expect_clarify")]
+    head = normal[:limit] if limit else normal
+    return head + clarify
 
 
 def load_done(path: Path) -> set[str]:
@@ -148,7 +155,15 @@ def main() -> None:
     import os
     has_llm = bool(os.environ.get("RAG_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"))
     generator = AnswerGenerator() if has_llm else None
+    # judge 默认用独立模型 deepseek-v4.1-flash（避免生成模型自评偏差）；
+    # 可用 RAG_JUDGE_MODEL / RAG_JUDGE_BASE_URL / RAG_JUDGE_API_KEY 覆盖。
+    judge_model = os.environ.get("RAG_JUDGE_MODEL", "deepseek-v4.1-flash")
+    if args.ragas:
+        os.environ.setdefault("RAG_JUDGE_MODEL", judge_model)
     judge = RagasJudge(encoder=pipe.encoder) if (args.ragas and has_llm) else None
+    if args.ragas and judge is not None:
+        gen_model = os.environ.get("RAG_LLM_MODEL", "glm-5.3-flash")
+        print(f"[run] judge 模型 = {judge.model}（生成模型 = {gen_model}）", flush=True)
     if args.ragas and not has_llm:
         print("[run] 未设 LLM key -> 跳过 RAGAS", flush=True)
 

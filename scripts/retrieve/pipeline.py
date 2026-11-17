@@ -83,6 +83,7 @@ class RetrievalPipeline:
           - use_rerank: False 跳过 BGE-Rerank，直接用 RRF 顺序
           - use_hard_filter: False 关闭 pre-filter + 后置复核（观察硬约束的价值）
           - recall_routes: 只启用指定召回路，如 ["dense"]（观察多路召回的价值）
+          - shop_dedup: False 关闭店铺级去重，退回 chunk 级 Top-N（观察该优化的价值）
         关硬约束时用空 SearchSlots 编译 filter/复核，但 trace.slots 仍保留原解析
         结果，便于分析"解析对了但没执行"造成的指标差异。
         """
@@ -90,6 +91,7 @@ class RetrievalPipeline:
         ab = ablation or {}
         use_rerank = ab.get("use_rerank", True)
         use_hard_filter = ab.get("use_hard_filter", True)
+        shop_dedup = ab.get("shop_dedup", True)  # 优化默认开启；消融可关掉对比
         routes = ab.get("recall_routes", ["dense", "sparse", "bm25"])
         t = time.time()
 
@@ -138,12 +140,25 @@ class RetrievalPipeline:
         ]
         trace.timings_ms["4_rrf"] = (time.time() - t) * 1000
 
-        # ⑤ Rerank 精排（取 RRF 前 N）
+        # ⑤ Rerank 精排（对全部 RRF 候选打分，再按店去重取 Top-N 家不同的店）
         t = time.time()
         if use_rerank:
-            reranked = self.reranker.rerank(query, fused[:config.RRF_TOPN], topn=topn)
+            reranked = self.reranker.rerank(
+                query, fused[:config.RRF_TOPN], topn=topn, dedup_by_shop=shop_dedup)
+        elif shop_dedup:
+            # 无精排但保留店铺去重：按 RRF 顺序取每家店最高分块（观察"仅去重"的价值）
+            seen, uniq = set(), []
+            for c in fused:
+                sid = (c.payload or {}).get("source_shop_id") or c.chunk_id
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                uniq.append(c)
+                if len(uniq) >= topn:
+                    break
+            reranked = uniq
         else:
-            reranked = fused[:topn]  # 消融：跳过精排，直接用 RRF 顺序
+            reranked = fused[:topn]  # 消融：既无精排也无去重，纯 RRF chunk 顺序
         trace.rerank_top = [
             {"shop": c.payload.get("shop_name"), "score": round(c.score, 4),
              "sources": c.sources, "ranks": c.ranks}

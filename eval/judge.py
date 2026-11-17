@@ -51,12 +51,34 @@ def _as_bool(v) -> bool:
 
 class RagasJudge:
     def __init__(self, encoder=None, cache_path: Path | None = None):
-        cfg = LLMConfig.from_env()
-        cfg.max_tokens = 900
+        # 【独立 judge 模型】默认 deepseek-v4.1-flash，与生成端 glm 分开，
+        # 避免"同一模型既当运动员又当裁判"的自评偏差（生成答案的模型和打分
+        # 的模型若是同一个，会系统性偏袒自己的输出）。
+        # 可用 RAG_JUDGE_* 覆盖；不设时回退到 RAG_LLM_*（向后兼容旧行为）。
+        import os
+        cfg = LLMConfig(
+            api_key=(os.environ.get("RAG_JUDGE_API_KEY")
+                     or os.environ.get("RAG_LLM_API_KEY")
+                     or os.environ.get("OPENAI_API_KEY", "")),
+            base_url=(os.environ.get("RAG_JUDGE_BASE_URL")
+                      or os.environ.get("RAG_LLM_BASE_URL")),
+            model=(os.environ.get("RAG_JUDGE_MODEL")
+                   or os.environ.get("RAG_LLM_MODEL", "glm-5.3-flash")),
+        )
+        # faithfulness 限制抽最多 8 个关键 claim（见该方法 prompt），输出很短；
+        # 1200 tokens 足够。之前不限制 claim 数时输出 2600+ 字符，长输出在
+        # 本地 LLM 服务上会超时（实测 96s 后 APIConnectionError）导致 None。
+        cfg.max_tokens = 1200
+        cfg.timeout = 120.0
+        cfg.retries = 1
+        self.model = cfg.model
         self.client = LLMClient(cfg)
         self.encoder = encoder  # 复用 pipeline 已加载的 BGE-M3，避免重复占 2GB 内存
         self.cache_path = Path(cache_path) if cache_path else ROOT / "eval" / "out" / "judge_cache.jsonl"
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # 【缓存 key 带模型名】换 judge 模型后自动失效旧缓存，否则换了模型
+        # 仍命中 glm 时代的打分，等于没换。不同模型的判断分开存、互不污染。
+        self.cache_ns = f"{self.model}::"
         self.cache: dict[str, dict] = {}
         if self.cache_path.exists():
             with self.cache_path.open(encoding="utf-8") as f:
@@ -72,12 +94,14 @@ class RagasJudge:
         return parse_json(self.client.chat(system, user))
 
     def _cached(self, key: str, fn):
-        if key in self.cache:
-            return self.cache[key]["value"]
+        full_key = self.cache_ns + key
+        if full_key in self.cache:
+            return self.cache[full_key]["value"]
         value = fn()
         with self.cache_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({"key": key, "value": value}, ensure_ascii=False) + "\n")
-        self.cache[key] = {"key": key, "value": value}
+            f.write(json.dumps({"key": full_key, "value": value,
+                                "model": self.model}, ensure_ascii=False) + "\n")
+        self.cache[full_key] = {"key": full_key, "value": value, "model": self.model}
         return value
 
     @staticmethod
@@ -87,8 +111,9 @@ class RagasJudge:
     def faithfulness(self, query: str, answer: str, contexts: list[str]) -> float | None:
         """答案里的事实陈述，有多少能被参考资料支持。"""
         def calc() -> float | None:
-            d = self._ask_json(SYS, f"""请从【答案】中抽取所有原子事实陈述（每条只表达一个事实），
-逐条判断该陈述是否能由【参考资料】直接支持或合理推断。注意：店名、价格、评分、菜系等都要作为独立陈述检查。
+            d = self._ask_json(SYS, f"""请从【答案】中抽取最多 8 个原子事实陈述
+（每条只表达一个事实，优先店名/价格/评分/菜系等关键信息），
+逐条判断该陈述是否能由【参考资料】直接支持或合理推断。
 
 【问题】{query}
 【答案】{answer}
